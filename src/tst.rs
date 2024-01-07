@@ -1,15 +1,9 @@
-#![feature(generic_const_exprs)]
-#![feature(strict_provenance)]
-#![allow(incomplete_features)]
 use std::alloc::Layout;
 use std::mem::ManuallyDrop;
 use std::{
     mem::align_of,
-    mem::{forget, size_of},
-    ptr::invalid_mut,
+    mem::{forget, size_of}
 };
-
-mod tst;
 
 pub trait Clear {
     type Empty;
@@ -19,56 +13,58 @@ pub trait Clear {
 
 // Safety Invariant: ptr is an empty dangling or a global_allocd pointer of `ALIGN` alignment to a buffer of `capacity * SIZE <= isize::MAX` bytes
 //   `capacity` is bounded by isize::MAX
-pub struct EmptyVec<const SIZE: usize, const ALIGN: usize> {
+pub struct EmptyVec {
     capacity: usize,
     ptr: *const (),
+    align: usize,
+    size: usize
 }
 
-impl<const SIZE: usize, const ALIGN: usize> Default for EmptyVec<SIZE, ALIGN> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<const SIZE: usize, const ALIGN: usize> EmptyVec<SIZE, ALIGN> {
-    pub fn new() -> Self {
-        Self::with_capacity(0)
+impl EmptyVec {
+    pub fn new<T>() -> Self {
+        Self::with_capacity::<T>(0)
     }
 
-    pub fn with_capacity(capacity: usize) -> Self {
-        if SIZE == 0 {
+    pub fn with_capacity<T: Sized>(capacity: usize) -> Self {
+        if size_of::<T>() == 0 {
             EmptyVec {
-                ptr: invalid_mut(ALIGN),
+                ptr: align_of::<T>() as *mut _, // TODO: Switch to `invalid_mut` on stabilization of `strict_provenance`
                 capacity: isize::MAX as usize,
+                align: align_of::<T>(),
+                size: size_of::<T>()
             }
         } else if capacity == 0 {
             EmptyVec {
-                ptr: invalid_mut(ALIGN),
+                ptr: align_of::<T>() as *mut _, // TODO: Switch to `invalid_mut` on stabilization of `strict_provenance`
                 capacity: 0,
+                align: align_of::<T>(),
+                size: size_of::<T>()
             }
         } else {
-            assert!(capacity < (isize::MAX as usize - 1) / SIZE);
+            assert!(capacity < (isize::MAX as usize - 1) / size_of::<T>());
             // SAFETY: We check that neither the size nor the capacity are zero, so the layout has non-zero size
             EmptyVec {
                 ptr: unsafe {
-                    std::alloc::alloc(Layout::from_size_align(SIZE * capacity, ALIGN).unwrap())
+                    std::alloc::alloc(Layout::from_size_align(size_of::<T>() * capacity, align_of::<T>()).unwrap())
                         as *const ()
                 },
                 capacity,
+                align: align_of::<T>(),
+                size: size_of::<T>()
             }
         }
     }
 }
 
-impl<const SIZE: usize, const ALIGN: usize> Drop for EmptyVec<SIZE, ALIGN> {
+impl Drop for EmptyVec {
     fn drop(&mut self) {
-        if SIZE != 0 && self.capacity != 0 {
+        if self.size != 0 && self.capacity != 0 {
             // SAFETY: If the size and capacity are non-zero the buffer must be non-empty so it is not dangling,
             //   and has thus been allocated by the global allocator
             unsafe {
                 std::alloc::dealloc(
                     self.ptr as *mut u8,
-                    Layout::from_size_align(SIZE * self.capacity, ALIGN).unwrap(),
+                    Layout::from_size_align(self.size * self.capacity, self.align).unwrap(),
                 )
             }
         }
@@ -79,8 +75,10 @@ trait EmptyCollection<Collection> {
     fn typed(self) -> Collection;
 }
 
-impl<T> EmptyCollection<Vec<T>> for EmptyVec<{ size_of::<T>() }, { align_of::<T>() }> {
+impl<T> EmptyCollection<Vec<T>> for EmptyVec {
     fn typed(self) -> Vec<T> {
+        assert!(size_of::<T>() == self.size);
+        assert!(align_of::<T>() == self.align);
         let ev = ManuallyDrop::new(self);
         // SAFETY: The pointer is empty and dangling or points to an allocation from the global allocator.
         //   The buffer if allocated was allocated with the alignment of `T`.
@@ -92,12 +90,8 @@ impl<T> EmptyCollection<Vec<T>> for EmptyVec<{ size_of::<T>() }, { align_of::<T>
     }
 }
 
-impl<T> Clear for Vec<T>
-where
-    [(); align_of::<T>()]: Sized,
-    [(); size_of::<T>()]: Sized,
-{
-    type Empty = EmptyVec<{ align_of::<T>() }, { size_of::<T>() }>;
+impl<T> Clear for Vec<T> {
+    type Empty = EmptyVec;
 
     fn clear(mut self) -> Self::Empty {
         Vec::clear(&mut self);
@@ -107,13 +101,15 @@ where
         EmptyVec {
             ptr: ptr as *const (),
             capacity,
+            align: align_of::<T>(),
+            size: size_of::<T>()
         }
     }
 }
 
 #[test]
 fn test_vec() {
-    let mut a = EmptyVec::new();
+    let mut a = EmptyVec::new::<&i32>();
     for _ in 0..2 {
         let mut b = a.typed();
         let c = &8;
